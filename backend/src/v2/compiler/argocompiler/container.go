@@ -62,7 +62,7 @@ func GetLauncherImage() string {
     if launcherImage == "" {
         launcherImage = DefaultLauncherImage
     }
-    return launcherImage
+    return "kfp-launcher-xunxu:0.0.1-aarch64-beta"
 }
 
 func GetDriverImage() string {
@@ -70,7 +70,7 @@ func GetDriverImage() string {
     if driverImage == "" {
         driverImage = DefaultDriverImage
     }
-    return driverImage
+    return "kfp-driver-xunxu:0.0.1-aarch64-beta"
 }
 
 func (c *workflowCompiler) containerDriverTask(name string, inputs containerDriverInputs) (*wfapi.DAGTask, *containerDriverOutputs) {
