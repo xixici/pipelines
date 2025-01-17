@@ -113,12 +113,13 @@ func toApiExperiment(experiment *model.Experiment) *apiv2beta1.Experiment {
 		storageState = apiv2beta1.Experiment_StorageState(apiv2beta1.Experiment_StorageState_value["STORAGE_STATE_UNSPECIFIED"])
 	}
 	return &apiv2beta1.Experiment{
-		ExperimentId: experiment.UUID,
-		DisplayName:  experiment.Name,
-		Description:  experiment.Description,
-		CreatedAt:    &timestamp.Timestamp{Seconds: experiment.CreatedAtInSec},
-		Namespace:    experiment.Namespace,
-		StorageState: storageState,
+		ExperimentId:     experiment.UUID,
+		DisplayName:      experiment.Name,
+		Description:      experiment.Description,
+		CreatedAt:        &timestamp.Timestamp{Seconds: experiment.CreatedAtInSec},
+		LastRunCreatedAt: &timestamp.Timestamp{Seconds: experiment.LastRunCreatedAtInSec},
+		Namespace:        experiment.Namespace,
+		StorageState:     storageState,
 	}
 }
 
@@ -631,7 +632,7 @@ func toApiParametersV1(p string) []*apiv1beta1.Parameter {
 	if p == "" || p == "null" || p == "[]" {
 		return apiParams
 	}
-	params, err := util.UnmarshalParameters(util.ArgoWorkflow, p)
+	params, err := util.UnmarshalParameters(util.CurrentExecutionType(), p)
 	if err != nil {
 		return nil
 	}
@@ -1913,7 +1914,7 @@ func toModelJob(j interface{}) (*model.Job, error) {
 		return nil, util.NewUnknownApiVersionError("RecurringRun", j)
 	}
 	if maxConcur > 10 || maxConcur < 1 {
-		return nil, util.NewInvalidInputError("Max concurrency of a recurring run must be at leas 1 and at most 10. Received %v", maxConcur)
+		return nil, util.NewInvalidInputError("Max concurrency of a recurring run must be at least 1 and at most 10. Received %v", maxConcur)
 	}
 	if trigger != nil && trigger.CronSchedule.Cron != nil {
 		if _, err := cron.Parse(*trigger.CronSchedule.Cron); err != nil {
