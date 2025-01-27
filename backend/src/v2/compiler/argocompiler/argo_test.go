@@ -48,6 +48,11 @@ func Test_argo_compiler(t *testing.T) {
 			argoYAMLPath:     "testdata/importer.yaml",
 		},
 		{
+			jobPath:          "../testdata/multiple_parallel_loops.json",
+			platformSpecPath: "",
+			argoYAMLPath:     "testdata/multiple_parallel_loops.yaml",
+		},
+		{
 			jobPath:          "../testdata/create_mount_delete_dynamic_pvc.json",
 			platformSpecPath: "../testdata/create_mount_delete_dynamic_pvc_platform.json",
 			argoYAMLPath:     "testdata/create_mount_delete_dynamic_pvc.yaml",
@@ -56,6 +61,11 @@ func Test_argo_compiler(t *testing.T) {
 			jobPath:          "../testdata/hello_world.json",
 			platformSpecPath: "../testdata/create_pod_metadata.json",
 			argoYAMLPath:     "testdata/create_pod_metadata.yaml",
+		},
+		{
+			jobPath:          "../testdata/exit_handler.json",
+			platformSpecPath: "",
+			argoYAMLPath:     "testdata/exit_handler.yaml",
 		},
 	}
 	for _, tt := range tests {

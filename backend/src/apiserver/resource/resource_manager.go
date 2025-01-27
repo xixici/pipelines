@@ -18,8 +18,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	scheduledworkflow "github.com/kubeflow/pipelines/backend/src/crd/pkg/apis/scheduledworkflow/v1beta1"
 	"io"
 	"net"
+	"reflect"
 	"strconv"
 
 	"github.com/cenkalti/backoff"
@@ -405,13 +407,6 @@ func (r *ResourceManager) CreatePipelineAndPipelineVersion(p *model.Pipeline, pv
 		return nil, nil, util.Wrap(err, "Failed to create a pipeline and a pipeline version")
 	}
 
-	// TODO(gkcalat): consider removing this after v2beta1 GA if we adopt storing PipelineSpec in DB.
-	// Store the pipeline file
-	err = r.objectStore.AddFile(tmpl.Bytes(), r.objectStore.GetPipelineKey(newVersion.UUID))
-	if err != nil {
-		return nil, nil, util.Wrap(err, "Failed to create a pipeline and a pipeline version due to error saving PipelineSpec to ObjectStore")
-	}
-
 	newPipeline.Status = model.PipelineReady
 	err = r.pipelineStore.UpdatePipelineStatus(
 		newPipeline.UUID,
@@ -517,6 +512,20 @@ func (r *ResourceManager) CreateRun(ctx context.Context, run *model.Run) (*model
 		return nil, util.NewInternalServerError(util.NewInvalidInputError("Namespace cannot be empty when creating an Argo workflow. Check if you have specified POD_NAMESPACE or try adding the parent namespace to the request"), "Failed to create a run due to empty namespace")
 	}
 	executionSpec.SetExecutionNamespace(k8sNamespace)
+
+	// assign OwnerReference to scheduledworkflow
+	if run.RecurringRunId != "" {
+		job, err := r.jobStore.GetJob(run.RecurringRunId)
+		if err != nil {
+			return nil, util.NewInternalServerError(util.NewInvalidInputError("RecurringRunId doesn't exist: %s", run.RecurringRunId), "Failed to create a run due to invalid recurring run id")
+		}
+		swf, err := r.swfClient.ScheduledWorkflow(job.Namespace).Get(ctx, job.K8SName, v1.GetOptions{})
+		if err != nil {
+			return nil, util.NewInternalServerError(util.NewInvalidInputError("ScheduledWorkflow doesn't exist: %s", job.K8SName), "Failed to create a run due to invalid name")
+		}
+		executionSpec.SetOwnerReferences(swf)
+	}
+
 	newExecSpec, err := r.getWorkflowClient(k8sNamespace).Create(ctx, executionSpec, v1.CreateOptions{})
 	if err != nil {
 		if err, ok := err.(net.Error); ok && err.Timeout() {
@@ -550,7 +559,85 @@ func (r *ResourceManager) CreateRun(ctx context.Context, run *model.Run) (*model
 	if err != nil {
 		return nil, util.Wrap(err, "Failed to create a run")
 	}
+
+	// Upon run creation, update owning experiment
+	err = r.experimentStore.SetLastRunTimestamp(newRun)
+	if err != nil {
+		return nil, util.Wrap(err, fmt.Sprintf("Failed to set last run timestamp on experiment %s for run %s", newRun.ExperimentId, newRun.UUID))
+	}
+
 	return newRun, nil
+}
+
+// ReconcileSwfCrs reconciles the ScheduledWorkflow CRs based on existing jobs.
+func (r *ResourceManager) ReconcileSwfCrs(ctx context.Context) error {
+	filterContext := &model.FilterContext{
+		ReferenceKey: &model.ReferenceKey{Type: model.NamespaceResourceType, ID: common.GetPodNamespace()},
+	}
+
+	opts := list.EmptyOptions()
+
+	jobs, _, _, err := r.jobStore.ListJobs(filterContext, opts)
+
+	if err != nil {
+		return util.Wrap(err, "Failed to reconcile ScheduledWorkflow Kubernetes resources")
+	}
+
+	for i := range jobs {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+
+		tmpl, _, err := r.fetchTemplateFromPipelineSpec(&jobs[i].PipelineSpec)
+		if err != nil {
+			return failedToReconcileSwfCrsError(err)
+		}
+
+		newScheduledWorkflow, err := tmpl.ScheduledWorkflow(jobs[i])
+		if err != nil {
+			return failedToReconcileSwfCrsError(err)
+		}
+
+		for {
+			currentScheduledWorkflow, err := r.getScheduledWorkflowClient(jobs[i].Namespace).Get(ctx, jobs[i].K8SName, v1.GetOptions{})
+			if err != nil {
+				if util.IsNotFound(err) {
+					break
+				}
+				return failedToReconcileSwfCrsError(err)
+			}
+
+			if !reflect.DeepEqual(currentScheduledWorkflow.Spec, newScheduledWorkflow.Spec) {
+				currentScheduledWorkflow.Spec = newScheduledWorkflow.Spec
+				err = r.updateSwfCrSpec(ctx, jobs[i].Namespace, currentScheduledWorkflow)
+				if err != nil {
+					if apierrors.IsConflict(errors.Unwrap(err)) {
+						continue
+					} else if util.IsNotFound(errors.Cause(err)) {
+						break
+					}
+					return failedToReconcileSwfCrsError(err)
+				}
+			}
+			break
+		}
+	}
+
+	return nil
+}
+
+func failedToReconcileSwfCrsError(err error) error {
+	return util.Wrap(err, "Failed to reconcile ScheduledWorkflow Kubernetes resources")
+}
+
+func (r *ResourceManager) updateSwfCrSpec(ctx context.Context, k8sNamespace string, scheduledWorkflow *scheduledworkflow.ScheduledWorkflow) error {
+	_, err := r.getScheduledWorkflowClient(k8sNamespace).Update(ctx, scheduledWorkflow)
+	if err != nil {
+		return util.Wrap(err, "Failed to update ScheduledWorkflow")
+	}
+	return nil
 }
 
 // Fetches a run with a given id.
@@ -708,11 +795,7 @@ func (r *ResourceManager) ListJobs(filterContext *model.FilterContext, opts *lis
 
 // Terminates a workflow by setting its activeDeadlineSeconds to 0.
 func TerminateWorkflow(ctx context.Context, wfClient util.ExecutionInterface, name string) error {
-	patchObj := map[string]interface{}{
-		"spec": map[string]interface{}{
-			"activeDeadlineSeconds": 0,
-		},
-	}
+	patchObj := util.GetTerminatePatch(util.CurrentExecutionType())
 	patch, err := json.Marshal(patchObj)
 	if err != nil {
 		return util.NewInternalServerError(err, "Failed to terminate workflow %s due to error parsing the patch", name)
@@ -881,7 +964,7 @@ func (r *ResourceManager) readRunLogFromArchive(workflowManifest string, nodeId 
 		return util.NewInternalServerError(util.NewInvalidInputError("Runtime workflow manifest cannot empty"), "Failed to read logs from archive %v due to empty runtime workflow manifest", nodeId)
 	}
 
-	execSpec, err := util.NewExecutionSpecJSON(util.ArgoWorkflow, []byte(workflowManifest))
+	execSpec, err := util.NewExecutionSpecJSON(util.CurrentExecutionType(), []byte(workflowManifest))
 	if err != nil {
 		return util.NewInternalServerError(err, "Failed to read logs from archive %v due error reading execution spec", nodeId)
 	}
@@ -965,12 +1048,6 @@ func (r *ResourceManager) CreateJob(ctx context.Context, job *model.Job) (*model
 		return nil, util.NewInternalServerError(err, "Failed to create a recurring run with an invalid pipeline spec manifest")
 	}
 
-	// TODO(gkcalat): consider changing the flow. Other resource UUIDs are assigned by their respective stores (DB).
-	// Convert modelJob into scheduledWorkflow.
-	scheduledWorkflow, err := tmpl.ScheduledWorkflow(job)
-	if err != nil {
-		return nil, util.Wrap(err, "Failed to create a recurring run during scheduled workflow creation")
-	}
 	// Create a new ScheduledWorkflow at the ScheduledWorkflow client.
 	k8sNamespace := job.Namespace
 	if k8sNamespace == "" {
@@ -978,6 +1055,15 @@ func (r *ResourceManager) CreateJob(ctx context.Context, job *model.Job) (*model
 	}
 	if k8sNamespace == "" {
 		return nil, util.NewInternalServerError(util.NewInvalidInputError("Namespace cannot be empty when creating an Argo scheduled workflow. Check if you have specified POD_NAMESPACE or try adding the parent namespace to the request"), "Failed to create a recurring run due to empty namespace")
+	}
+
+	job.Namespace = k8sNamespace
+
+	// TODO(gkcalat): consider changing the flow. Other resource UUIDs are assigned by their respective stores (DB).
+	// Convert modelJob into scheduledWorkflow.
+	scheduledWorkflow, err := tmpl.ScheduledWorkflow(job)
+	if err != nil {
+		return nil, util.Wrap(err, "Failed to create a recurring run during scheduled workflow creation")
 	}
 	newScheduledWorkflow, err := r.getScheduledWorkflowClient(k8sNamespace).Create(ctx, scheduledWorkflow)
 	if err != nil {
@@ -990,23 +1076,23 @@ func (r *ResourceManager) CreateJob(ctx context.Context, job *model.Job) (*model
 	swf := util.NewScheduledWorkflow(newScheduledWorkflow)
 	job.UUID = string(swf.UID)
 	job.K8SName = swf.Name
-	job.Namespace = swf.Namespace
 	job.Conditions = model.StatusState(swf.ConditionSummary()).ToString()
 	for _, modelRef := range job.ResourceReferences {
 		modelRef.ResourceUUID = string(swf.UID)
 	}
-	// Get the service account
-	serviceAccount := ""
-	if swf.Spec.Workflow != nil {
-		execSpec, err := util.ScheduleSpecToExecutionSpec(util.ArgoWorkflow, swf.Spec.Workflow)
-		if err == nil {
-			serviceAccount = execSpec.ServiceAccount()
-		}
-	}
-	job.ServiceAccount = serviceAccount
 	if tmpl.GetTemplateType() == template.V1 {
+		// Get the service account
+		serviceAccount := ""
+		if swf.Spec.Workflow != nil {
+			execSpec, err := util.ScheduleSpecToExecutionSpec(util.ArgoWorkflow, swf.Spec.Workflow)
+			if err == nil {
+				serviceAccount = execSpec.ServiceAccount()
+			}
+		}
+		job.ServiceAccount = serviceAccount
 		job.PipelineSpec.WorkflowSpecManifest = manifest
 	} else {
+		job.ServiceAccount = newScheduledWorkflow.Spec.ServiceAccount
 		job.PipelineSpec.PipelineSpecManifest = manifest
 	}
 	return r.jobStore.CreateJob(job)
@@ -1234,6 +1320,10 @@ func (r *ResourceManager) ReportWorkflowResource(ctx context.Context, execSpec u
 			return nil, util.Wrapf(err, "Failed to report a workflow due to error creating run %s", runId)
 		} else {
 			runId = run.UUID
+		}
+		// Upon run creation, update owning experiment
+		if updateError = r.experimentStore.SetLastRunTimestamp(run); updateError != nil {
+			return nil, util.Wrapf(updateError, "Failed to report a workflow for existing run %s during updating the owning experiment.", runId)
 		}
 	}
 	if execStatus.IsInFinalState() {
@@ -1525,15 +1615,8 @@ func (r *ResourceManager) CreatePipelineVersion(pv *model.PipelineVersion) (*mod
 		return nil, util.Wrap(err, "Failed to create pipeline version in PipelineStore")
 	}
 
-	// TODO(gkcalat): consider removing this after v2beta1 GA if we adopt storing PipelineSpec in DB.
-	// Store the pipeline file
-	err = r.objectStore.AddFile(tmpl.Bytes(), r.objectStore.GetPipelineKey(fmt.Sprint(version.UUID)))
-	if err != nil {
-		return nil, util.Wrap(err, "Failed to create a pipeline version due to error saving PipelineSpec to ObjectStore")
-	}
-
 	// After pipeline version being created in DB and pipeline file being
-	// saved in minio server, set this pieline version to status ready.
+	// saved in minio server, set this pipeline version to status ready.
 	version.Status = model.PipelineVersionReady
 	err = r.pipelineStore.UpdatePipelineVersionStatus(version.UUID, version.Status)
 	if err != nil {
@@ -1542,10 +1625,19 @@ func (r *ResourceManager) CreatePipelineVersion(pv *model.PipelineVersion) (*mod
 	return version, nil
 }
 
-// Returns a pipeline version.
+// Returns a pipeline version by Id.
 func (r *ResourceManager) GetPipelineVersion(pipelineVersionId string) (*model.PipelineVersion, error) {
 	if pipelineVersion, err := r.pipelineStore.GetPipelineVersion(pipelineVersionId); err != nil {
 		return nil, util.Wrapf(err, "Failed to get a pipeline version with id %v", pipelineVersionId)
+	} else {
+		return pipelineVersion, nil
+	}
+}
+
+// Returns a pipeline version by Name.
+func (r *ResourceManager) GetPipelineVersionByName(name string) (*model.PipelineVersion, error) {
+	if pipelineVersion, err := r.pipelineStore.GetPipelineVersionByName(name); err != nil {
+		return nil, util.Wrapf(err, "Failed to get a pipeline version with name %v", name)
 	} else {
 		return pipelineVersion, nil
 	}
@@ -1579,7 +1671,7 @@ func (r *ResourceManager) ListPipelineVersions(pipelineId string, opts *list.Opt
 // Deletes a pipeline version and the corresponding PipelineSpec.
 func (r *ResourceManager) DeletePipelineVersion(pipelineVersionId string) error {
 	// Check if pipeline version exists
-	pipelineVersion, err := r.pipelineStore.GetPipelineVersion(pipelineVersionId)
+	_, err := r.pipelineStore.GetPipelineVersion(pipelineVersionId)
 	if err != nil {
 		return util.Wrapf(err, "Failed to delete pipeline version with id %v as it was not found", pipelineVersionId)
 	}
@@ -1600,41 +1692,7 @@ func (r *ResourceManager) DeletePipelineVersion(pipelineVersionId string) error 
 	// either using async deletion in order for this method to be non-blocking
 	// or or exploring other performance optimization tools provided by gcs.
 	//
-	// TODO(gkcalat): consider removing this if we switch to storing PipelineSpec in DB.
-	// DeleteObject always responds with http '204' even for
-	// objects which do not exist. The err below will be nil.
-	//
-	// Delete based on pipeline spec URI
-	pipelineSpecRemoved := false
-	var osErr error
-	err = r.objectStore.DeleteFile(pipelineVersion.PipelineSpecURI)
-	if err != nil {
-		glog.Errorf("%v", util.Wrapf(err, "Failed to delete pipeline spec for pipeline version id %v with URI %v", pipelineVersionId, pipelineVersion.PipelineSpecURI))
-		osErr = util.Wrapf(err, "Failed to delete pipeline spec for pipeline version id %v with URI %v", pipelineVersionId, pipelineVersion.PipelineSpecURI)
-	} else {
-		pipelineSpecRemoved = true
-	}
-	// Delete based on pipeline version id
-	err = r.objectStore.DeleteFile(r.objectStore.GetPipelineKey(fmt.Sprint(pipelineVersionId)))
-	if err != nil {
-		glog.Errorf("%v", util.Wrapf(err, "Failed to delete pipeline spec for pipeline version id %v", pipelineVersionId))
-		err = util.Wrapf(err, "Failed to delete pipeline spec for pipeline version id %v", pipelineVersionId)
-		osErr = util.Wrap(osErr, err.Error())
-	} else {
-		pipelineSpecRemoved = true
-	}
-	// Delete based on pipeline id
-	err = r.objectStore.DeleteFile(r.objectStore.GetPipelineKey(fmt.Sprint(pipelineVersion.PipelineId)))
-	if err != nil {
-		glog.Errorf("%v", util.Wrapf(err, "Failed to delete pipeline spec for pipeline version id %v using pipeline id %v", pipelineVersionId, pipelineVersion.PipelineId))
-		err = util.Wrapf(err, "Failed to delete pipeline spec for pipeline version id %v using pipeline id %v", pipelineVersionId, pipelineVersion.PipelineId)
-		osErr = util.Wrap(osErr, err.Error())
-	} else {
-		pipelineSpecRemoved = true
-	}
-	if !pipelineSpecRemoved {
-		return util.Wrap(osErr, "Failed to delete a pipeline spec")
-	}
+
 	// Delete the DB entry
 	err = r.pipelineStore.DeletePipelineVersion(pipelineVersionId)
 	if err != nil {
