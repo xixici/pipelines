@@ -29,6 +29,7 @@ import (
 	"github.com/kubeflow/pipelines/backend/src/common/util"
 	scheduledworkflow "github.com/kubeflow/pipelines/backend/src/crd/pkg/apis/scheduledworkflow/v1beta1"
 	"github.com/kubeflow/pipelines/backend/src/v2/compiler/argocompiler"
+	"github.com/kubeflow/pipelines/backend/src/v2/compiler/tektoncompiler"
 	"google.golang.org/protobuf/encoding/protojson"
 	goyaml "gopkg.in/yaml.v3"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -38,6 +39,39 @@ import (
 type V2Spec struct {
 	spec         *pipelinespec.PipelineSpec
 	platformSpec *pipelinespec.PlatformSpec
+}
+
+var Launcher = ""
+
+func NewGenericScheduledWorkflow(modelJob *model.Job) (*scheduledworkflow.ScheduledWorkflow, error) {
+	swfGeneratedName, err := toSWFCRDResourceGeneratedName(modelJob.K8SName)
+	if err != nil {
+		return nil, util.Wrap(err, "Create job failed")
+	}
+
+	crdTrigger, err := modelToCRDTrigger(modelJob.Trigger)
+	if err != nil {
+		return nil, util.Wrap(err, "converting model trigger to crd trigger failed")
+	}
+
+	return &scheduledworkflow.ScheduledWorkflow{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "kubeflow.org/v2beta1",
+			Kind:       "ScheduledWorkflow",
+		},
+		ObjectMeta: metav1.ObjectMeta{GenerateName: swfGeneratedName},
+		Spec: scheduledworkflow.ScheduledWorkflowSpec{
+			Enabled:           modelJob.Enabled,
+			MaxConcurrency:    &modelJob.MaxConcurrency,
+			Trigger:           crdTrigger,
+			NoCatchup:         util.BoolPointer(modelJob.NoCatchup),
+			ExperimentId:      modelJob.ExperimentId,
+			PipelineId:        modelJob.PipelineId,
+			PipelineName:      modelJob.PipelineName,
+			PipelineVersionId: modelJob.PipelineVersionId,
+			ServiceAccount:    modelJob.ServiceAccount,
+		},
+	}, nil
 }
 
 // Converts modelJob to ScheduledWorkflow.
@@ -72,14 +106,19 @@ func (t *V2Spec) ScheduledWorkflow(modelJob *model.Job) (*scheduledworkflow.Sche
 		}
 	}
 
-	obj, err := argocompiler.Compile(job, kubernetesSpec, nil)
+	var obj interface{}
+	if util.CurrentExecutionType() == util.ArgoWorkflow {
+		obj, err = argocompiler.Compile(job, kubernetesSpec, nil)
+	} else if util.CurrentExecutionType() == util.TektonPipelineRun {
+		obj, err = tektoncompiler.Compile(job, kubernetesSpec, &tektoncompiler.Options{LauncherImage: Launcher})
+	}
 	if err != nil {
 		return nil, util.Wrap(err, "Failed to compile job")
 	}
 	// currently, there is only Argo implementation, so it's using `ArgoWorkflow` for now
 	// later on, if a new runtime support will be added, we need a way to switch/specify
 	// runtime. i.e using ENV var
-	executionSpec, err := util.NewExecutionSpecFromInterface(util.ArgoWorkflow, obj)
+	executionSpec, err := util.NewExecutionSpecFromInterface(util.CurrentExecutionType(), obj)
 	if err != nil {
 		return nil, util.NewInternalServerError(err, "error creating execution spec")
 	}
@@ -87,39 +126,28 @@ func (t *V2Spec) ScheduledWorkflow(modelJob *model.Job) (*scheduledworkflow.Sche
 	if modelJob.Namespace != "" {
 		executionSpec.SetExecutionNamespace(modelJob.Namespace)
 	}
-	setDefaultServiceAccount(executionSpec, modelJob.ServiceAccount)
+	if executionSpec.ServiceAccount() == "" {
+		setDefaultServiceAccount(executionSpec, modelJob.ServiceAccount)
+	}
 	// Disable istio sidecar injection if not specified
 	executionSpec.SetAnnotationsToAllTemplatesIfKeyNotExist(util.AnnotationKeyIstioSidecarInject, util.AnnotationValueIstioSidecarInjectDisabled)
-	swfGeneratedName, err := toSWFCRDResourceGeneratedName(modelJob.K8SName)
-	if err != nil {
-		return nil, util.Wrap(err, "Create job failed")
-	}
-	parameters, err := stringMapToCRDParameters(modelJob.RuntimeConfig.Parameters)
+	parameters, err := StringMapToCRDParameters(modelJob.RuntimeConfig.Parameters)
 	if err != nil {
 		return nil, util.Wrap(err, "Converting runtime config's parameters to CDR parameters failed")
 	}
-	crdTrigger, err := modelToCRDTrigger(modelJob.Trigger)
+
+	scheduledWorkflow, err := NewGenericScheduledWorkflow(modelJob)
 	if err != nil {
-		return nil, util.Wrap(err, "converting model trigger to crd trigger failed")
+		return nil, err
 	}
 
-	scheduledWorkflow := &scheduledworkflow.ScheduledWorkflow{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "kubeflow.org/v2beta1",
-			Kind:       "ScheduledWorkflow",
-		},
-		ObjectMeta: metav1.ObjectMeta{GenerateName: swfGeneratedName},
-		Spec: scheduledworkflow.ScheduledWorkflowSpec{
-			Enabled:        modelJob.Enabled,
-			MaxConcurrency: &modelJob.MaxConcurrency,
-			Trigger:        crdTrigger,
-			Workflow: &scheduledworkflow.WorkflowResource{
-				Parameters: parameters,
-				Spec:       executionSpec.ToStringForSchedule(),
-			},
-			NoCatchup: util.BoolPointer(modelJob.NoCatchup),
-		},
+	scheduledWorkflow.Spec.Workflow = &scheduledworkflow.WorkflowResource{
+		Parameters: parameters,
+		Spec:       executionSpec.ToStringForSchedule(),
 	}
+
+	scheduledWorkflow.Spec.ServiceAccount = executionSpec.ServiceAccount()
+
 	return scheduledWorkflow, nil
 }
 
@@ -268,7 +296,7 @@ func (t *V2Spec) RunWorkflow(modelRun *model.Run, options RunWorkflowOptions) (u
 	if err := protojson.Unmarshal(bytes, spec); err != nil {
 		return nil, util.NewInternalServerError(err, "Failed to parse pipeline spec")
 	}
-	job := &pipelinespec.PipelineJob{PipelineSpec: spec}
+	job := &pipelinespec.PipelineJob{PipelineSpec: spec, DisplayName: modelRun.DisplayName}
 	jobRuntimeConfig, err := modelToPipelineJobRuntimeConfig(&modelRun.RuntimeConfig)
 	if err != nil {
 		return nil, util.NewInternalServerError(err, "Failed to convert to PipelineJob RuntimeConfig")
@@ -285,11 +313,16 @@ func (t *V2Spec) RunWorkflow(modelRun *model.Run, options RunWorkflowOptions) (u
 		}
 	}
 
-	obj, err := argocompiler.Compile(job, kubernetesSpec, nil)
+	var obj interface{}
+	if util.CurrentExecutionType() == util.ArgoWorkflow {
+		obj, err = argocompiler.Compile(job, kubernetesSpec, nil)
+	} else if util.CurrentExecutionType() == util.TektonPipelineRun {
+		obj, err = tektoncompiler.Compile(job, kubernetesSpec, nil)
+	}
 	if err != nil {
 		return nil, util.Wrap(err, "Failed to compile job")
 	}
-	executionSpec, err := util.NewExecutionSpecFromInterface(util.ArgoWorkflow, obj)
+	executionSpec, err := util.NewExecutionSpecFromInterface(util.CurrentExecutionType(), obj)
 	if err != nil {
 		return nil, util.Wrap(err, "Error creating execution spec")
 	}

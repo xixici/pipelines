@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -87,7 +86,6 @@ func NewLauncherV2(ctx context.Context, executionID int64, executorInputJSON, co
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal executor input: %w", err)
 	}
-	glog.Infof("input ComponentSpec:%s\n", prettyPrint(componentSpecJSON))
 	component := &pipelinespec.ComponentSpec{}
 	err = protojson.Unmarshal([]byte(componentSpecJSON), component)
 	if err != nil {
@@ -143,12 +141,23 @@ func (l *LauncherV2) Execute(ctx context.Context) (err error) {
 	defer func() {
 		if perr := l.publish(ctx, execution, executorOutput, outputArtifacts, status); perr != nil {
 			if err != nil {
-				err = fmt.Errorf("failed to publish execution with error %w after execution failed: %w", perr, err)
+				err = fmt.Errorf("failed to publish execution with error %s after execution failed: %s", perr.Error(), err.Error())
 			} else {
 				err = perr
 			}
 		}
 		glog.Infof("publish success.")
+		// At the end of the current task, we check the statuses of all tasks in
+		// the current DAG and update the DAG's status accordingly.
+		dag, err := l.metadataClient.GetDAG(ctx, execution.GetExecution().CustomProperties["parent_dag_id"].GetIntValue())
+		if err != nil {
+			glog.Errorf("DAG Status Update: failed to get DAG: %s", err.Error())
+		}
+		pipeline, _ := l.metadataClient.GetPipelineFromExecution(ctx, execution.GetID())
+		err = l.metadataClient.UpdateDAGExecutionsState(ctx, dag, pipeline)
+		if err != nil {
+			glog.Errorf("failed to update DAG state: %s", err.Error())
+		}
 	}()
 	executedStartedTime := time.Now().Unix()
 	execution, err = l.prePublish(ctx)
@@ -156,7 +165,12 @@ func (l *LauncherV2) Execute(ctx context.Context) (err error) {
 		return err
 	}
 	fingerPrint := execution.FingerPrint()
-	bucketConfig, err := objectstore.ParseBucketConfig(execution.GetPipeline().GetPipelineRoot())
+	storeSessionInfo, err := objectstore.GetSessionInfoFromString(execution.GetPipeline().GetStoreSessionInfo())
+	if err != nil {
+		return err
+	}
+	pipelineRoot := execution.GetPipeline().GetPipelineRoot()
+	bucketConfig, err := objectstore.ParseBucketConfig(pipelineRoot, storeSessionInfo)
 	if err != nil {
 		return err
 	}
@@ -350,7 +364,7 @@ func collectOutputParameters(executorInput *pipelinespec.ExecutorInput, executor
 		msg := func(err error) error {
 			return fmt.Errorf("failed to read output parameter name=%q type=%q path=%q: %w", name, paramSpec.GetParameterType(), param.GetOutputFile(), err)
 		}
-		b, err := ioutil.ReadFile(param.GetOutputFile())
+		b, err := os.ReadFile(param.GetOutputFile())
 		if err != nil {
 			return msg(err)
 		}
@@ -454,7 +468,7 @@ func uploadOutputArtifacts(ctx context.Context, executorInput *pipelinespec.Exec
 		if err != nil {
 			return nil, fmt.Errorf("failed to determine schema for output %q: %w", name, err)
 		}
-		mlmdArtifact, err := opts.metadataClient.RecordArtifact(ctx, name, schema, outputArtifact, pb.Artifact_LIVE)
+		mlmdArtifact, err := opts.metadataClient.RecordArtifact(ctx, name, schema, outputArtifact, pb.Artifact_LIVE, opts.bucketConfig)
 		if err != nil {
 			return nil, metadataErr(err)
 		}
@@ -534,14 +548,22 @@ func fetchNonDefaultBuckets(
 		}
 		// TODO: Support multiple artifacts someday, probably through the v2 engine.
 		artifact := artifactList.Artifacts[0]
+		// The artifact does not belong under the object store path for this run. Cases:
+		// 1. Artifact is cached from a different run, so it may still be in the default bucket, but under a different run id subpath
+		// 2. Artifact is imported from the same bucket, but from a different path (re-use the same session)
+		// 3. Artifact is imported from a different bucket, or obj store (default to using user env in this case)
 		if !strings.HasPrefix(artifact.Uri, defaultBucketConfig.PrefixedBucket()) {
-			nonDefaultBucketConfig, err := objectstore.ParseBucketConfigForArtifactURI(artifact.Uri)
-			if err != nil {
-				return nonDefaultBuckets, fmt.Errorf("failed to parse bucketConfig for output artifact %q with uri %q: %w", name, artifact.GetUri(), err)
+			nonDefaultBucketConfig, parseErr := objectstore.ParseBucketConfigForArtifactURI(artifact.Uri)
+			if parseErr != nil {
+				return nonDefaultBuckets, fmt.Errorf("failed to parse bucketConfig for output artifact %q with uri %q: %w", name, artifact.GetUri(), parseErr)
 			}
-			nonDefaultBucket, err := objectstore.OpenBucket(ctx, k8sClient, namespace, nonDefaultBucketConfig)
-			if err != nil {
-				return nonDefaultBuckets, fmt.Errorf("failed to open bucket for output artifact %q with uri %q: %w", name, artifact.GetUri(), err)
+			// check if it's same bucket but under a different path, re-use the default bucket session in this case.
+			if (nonDefaultBucketConfig.Scheme == defaultBucketConfig.Scheme) && (nonDefaultBucketConfig.BucketName == defaultBucketConfig.BucketName) {
+				nonDefaultBucketConfig.SessionInfo = defaultBucketConfig.SessionInfo
+			}
+			nonDefaultBucket, bucketErr := objectstore.OpenBucket(ctx, k8sClient, namespace, nonDefaultBucketConfig)
+			if bucketErr != nil {
+				return nonDefaultBuckets, fmt.Errorf("failed to open bucket for output artifact %q with uri %q: %w", name, artifact.GetUri(), bucketErr)
 			}
 			nonDefaultBuckets[nonDefaultBucketConfig.PrefixedBucket()] = nonDefaultBucket
 		}
@@ -685,7 +707,7 @@ func getExecutorOutputFile(path string) (*pipelinespec.ExecutorOutput, error) {
 		}
 	}
 
-	b, err := ioutil.ReadFile(path)
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read output metadata file %q: %w", path, err)
 	}

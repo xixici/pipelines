@@ -51,8 +51,8 @@ fi
 
 echo "Running the bump version script in cloned repo"
 echo -n "$TAG" > ./VERSION
-# TODO(Bobgy): pin image tag
-PREBUILT_REMOTE_IMAGE=gcr.io/ml-pipeline-test/release:latest
+
+PREBUILT_REMOTE_IMAGE=ghcr.io/kubeflow/kfp-release:1.0
 pushd ./test/release
 make release-in-place
 popd

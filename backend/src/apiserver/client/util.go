@@ -15,14 +15,15 @@
 package client
 
 import (
+	"os"
+
 	"github.com/kubeflow/pipelines/backend/src/common/util"
 	"github.com/pkg/errors"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 )
 
 func getKubernetesClientset(clientParams util.ClientParameters) (*kubernetes.Clientset, error) {
-	restConfig, err := rest.InClusterConfig()
+	restConfig, err := util.GetKubernetesConfig()
 	if err != nil {
 		return nil, errors.Wrap(err, "Failed to initialize kubernetes client")
 	}
@@ -34,4 +35,16 @@ func getKubernetesClientset(clientParams util.ClientParameters) (*kubernetes.Cli
 		return nil, errors.Wrap(err, "Failed to initialize kubernetes client set")
 	}
 	return clientSet, nil
+}
+
+// PathExists exists returns whether the given file or directory exists
+func PathExists(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
 }

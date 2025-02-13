@@ -168,9 +168,10 @@ func (c *ClientManager) Authenticators() []auth.Authenticator {
 
 func (c *ClientManager) init() {
 	glog.Info("Initializing client manager")
+	glog.Info("Initializing DB client...")
 	db := InitDBClient(common.GetDurationConfig(initConnectionTimeout))
 	db.SetConnMaxLifetime(common.GetDurationConfig(dbConMaxLifeTime))
-
+	glog.Info("DB client initialized successfully")
 	// time
 	c.time = util.NewRealTime()
 
@@ -185,8 +186,9 @@ func (c *ClientManager) init() {
 	c.resourceReferenceStore = storage.NewResourceReferenceStore(db)
 	c.dBStatusStore = storage.NewDBStatusStore(db)
 	c.defaultExperimentStore = storage.NewDefaultExperimentStore(db)
+	glog.Info("Initializing Object store client...")
 	c.objectStore = initMinioClient(common.GetDurationConfig(initConnectionTimeout))
-
+	glog.Info("Object store client initialized successfully")
 	// Use default value of client QPS (5) & burst (10) defined in
 	// k8s.io/client-go/rest/config.go#RESTClientFor
 	clientParams := util.ClientParameters{
@@ -194,7 +196,7 @@ func (c *ClientManager) init() {
 		Burst: common.GetIntConfigWithDefault(clientBurst, 10),
 	}
 
-	c.execClient = util.NewExecutionClientOrFatal(util.ArgoWorkflow, common.GetDurationConfig(initConnectionTimeout), clientParams)
+	c.execClient = util.NewExecutionClientOrFatal(util.CurrentExecutionType(), common.GetDurationConfig(initConnectionTimeout), clientParams)
 
 	c.swfClient = client.NewScheduledWorkflowClientOrFatal(common.GetDurationConfig(initConnectionTimeout), clientParams)
 
@@ -342,6 +344,12 @@ func InitDBClient(initConnectionTimeout time.Duration) *storage.DB {
 			AddForeignKey("RunUUID", "run_details(UUID)", "CASCADE" /* onDelete */, "CASCADE" /* onUpdate */)
 		if ignoreAlreadyExistError(driverName, response.Error) != nil {
 			glog.Fatalf("Failed to create a foreign key for RunUUID in task table. Error: %s", response.Error)
+		}
+
+		// This is a workaround because AutoMigration does not detect that the column went from not null to nullable.
+		response = db.Model(&model.Job{}).ModifyColumn("WorkflowSpecManifest", client.MYSQL_TEXT_FORMAT_NULL)
+		if response.Error != nil {
+			glog.Fatalf("Failed to make the WorkflowSpecManifest column nullable on jobs. Error: %s", response.Error)
 		}
 	default:
 		glog.Fatalf("Driver %v is not supported, use \"mysql\" for MySQL, or \"pgx\" for PostgreSQL", driverName)
@@ -494,10 +502,10 @@ func initMinioClient(initConnectionTimeout time.Duration) storage.ObjectStoreInt
 }
 
 func createMinioBucket(minioClient *minio.Client, bucketName, region string) {
-	// Check to see if we already own this bucket.
+	// Check to see if it exists, and we have permission to access it.
 	exists, err := minioClient.BucketExists(bucketName)
 	if err != nil {
-		glog.Fatalf("Failed to check if Minio bucket exists. Error: %v", err)
+		glog.Fatalf("Failed to check if object store bucket exists. Error: %v", err)
 	}
 	if exists {
 		glog.Infof("We already own %s\n", bucketName)
@@ -506,7 +514,7 @@ func createMinioBucket(minioClient *minio.Client, bucketName, region string) {
 	// Create bucket if it does not exist
 	err = minioClient.MakeBucket(bucketName, region)
 	if err != nil {
-		glog.Fatalf("Failed to create Minio bucket. Error: %v", err)
+		glog.Fatalf("Failed to create object store bucket. Error: %v", err)
 	}
 	glog.Infof("Successfully created bucket %s\n", bucketName)
 }

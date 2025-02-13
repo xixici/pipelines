@@ -1,10 +1,97 @@
 ## Upcoming release
-* Add `v1.automl.forecasting.learn_to_learn_forecasting_pipeline`, `v1.automl.forecasting.sequence_to_sequence_forecasting_pipeline`, `v1.automl.forecasting.temporal_fusion_transformer_forecasting_pipeline`, `v1.automl.forecasting.time_series_dense_encoder_forecasting_pipeline` as Forecasting on Pipelines moves to GA.
+
+* Bump image for Structured Data pipelines.
+
+## Release 2.19.0
+
+* Add max_wait_duration to v1 GCPC custom job components/utils
+* Apply latest GCPC image vulnerability resolutions (base OS and software updates)
+
+## Release 2.18.0
+* Remove default prediction column names in `v1.model_evaluation.regression_component` component to fix pipeline errors when using bigquery data source.
+* Add reservation_affinition support in `v1.create_custom_training_job_from_component`.
+* Deprecate `preview.custom_job` module.
+* Fix default location in `v1.create_custom_training_job_from_component`.
+* Update Docker image.
+* Bump supported KFP versions to `kfp>=2.6.0,<2.11.0`.
+* Support Python versions 3.12 and 3.13.
+* Bump image for Structured Data pipelines.
+* Add strategy to v1 GCPC custom job components/utils
+* Apply latest GCPC image vulnerability resolutions (base OS and software updates)
+
+## Release 2.17.0
+* Fix Gemini batch prediction support to `v1.model_evaluation.autosxs_pipeline` after output schema change.
+* Modify the code to support latest bp result format
+* Update the StarryNet package metadata.
+* Use instance.target_field_name format for text-bison models only, use target_field_name for gemini models.
+* Pass model name to eval_runner to process batch prediction's output as per the output schema of model used.
+* Use LLM Model Evaluation image version v0.7
+* Update AutoSxS and RLHF image tags
+
+## Release 2.16.1
+* Fix to model batch explanation component for Structured Data pipelines; image bump.
+* Add dynamic support for boot_disk_type, boot_disk_size in `preview.custom_job.utils.create_custom_training_job_from_component`.
+* Remove preflight validations temporarily.
+* Apply latest GCPC image vulnerability resolutions (base OS and software updates).
+
+## Release 2.16.0
+* Updated the Starry Net pipeline's template gallery description, and added dataprep_nan_threshold and dataprep_zero_threshold args to the Starry Net pipeline.
+* Fix bug in Starry Net's upload decomposition plot step due to protobuf upgrade, by pinning protobuf library to 3.20.*.
+* Bump Starry Net image tags.
+* In the Starry-Net pipeline, enforce that TF Record generation always runs before test set generation to speed up pipelines runs.
+* Add support for running tasks on a `PersistentResource` (see [CustomJobSpec](https://cloud.google.com/vertex-ai/docs/reference/rest/v1beta1/CustomJobSpec)) via `persistent_resource_id` parameter on `v1.custom_job.CustomTrainingJobOp` and `v1.custom_job.create_custom_training_job_from_component`
+* Bump image for Structured Data pipelines.
+* Add check that component in preview.custom_job.utils.create_custom_training_job_from_component doesn't have any parameters that share names with any custom job fields
+* Add dynamic machine spec support for `preview.custom_job.utils.create_custom_training_job_from_component`.
+* Add preflight validations for LLM text generation pipeline.
+* Apply latest GCPC image vulnerability resolutions (base OS and software updates).
+
+## Release 2.15.0
+* Add Gemini batch prediction support to `v1.model_evaluation.autosxs_pipeline`.
+* Add Starry Net forecasting pipeline to `preview.starry_net.starry_net_pipeline`
+* Apply latest GCPC image vulnerability resolutions (base OS and software updates).
+
+## Release 2.14.1
+* Add staging and temp location parameters to prophet trainer component.
+* Add input parameter `autorater_prompt_parameters` to `_implementation.llm.online_evaluation_pairwise` component.
+* Mitigate bug in `v1.model_evaluation.autosxs_pipeline` where batch prediction would fail the first time it is run in a project by retrying.
+* Apply latest GCPC image vulnerability resolutions (base OS and software updates).
+
+## Release 2.14.0
+* Use larger base reward model when tuning `text-bison@001`, `chat-bison@001` and `t5-xxl` with the `preview.llm.rlhf_pipeline`.
+* Move `preview.model_evaluation.autosxs_pipeline` to `v1.model_evaluation.autosxs_pipeline`.
+* Remove default prediction column names in `v1.model_evaluation.classification_component` component to fix pipeline errors when using bigquery data source.
+* Move `_implementation.model_evaluation.ModelImportEvaluationOp` component to preview namespace `preview.model_evaluation.ModelImportEvaluationOp`.
+* Drop support for Python 3.7 since it has reached end-of-life.
+* Expand number of regions supported by `preview.llm.rlhf_pipeline`.
+* Apply latest GCPC image vulnerability resolutions (base OS and software updates).
+
+## Release 2.13.1
+* Fix model name preprocess error, pass correct model to `ModelImportEvaluationOp` component in `v1.model_evaluation.evaluation_llm_text_generation_pipeline` and `v1.model_evaluation.evaluation_llm_classification_pipeline`.
+* Apply latest GCPC image vulnerability resolutions (base OS and software updates).
+
+## Release 2.13.0
+* Add support for `text-bison@002` to `preview.llm.rlhf_pipeline`.
+* Apply latest GCPC image vulnerability resolutions (base OS and software updates).
+* Fix `preview.model_evaluation.autosxs_pipeline` documentation to show `autorater_prompt_parameters` as required.
+* Introduce placeholders: `SERVICE_ACCOUNT_PLACEHOLDER`, `NETWORK_PLACEHOLDER`, `PERSISTENT_RESOURCE_ID_PLACEHOLDER` and `ENCRYPTION_SPEC_KMS_KEY_NAME_PLACEHOLDER`
+* Use `PERSISTENT_RESOURCE_ID_PLACEHOLDER` as the default value of `persistent_resource_id` for `CustomTrainingJobOp` and `create_custom_training_job_op_from_component`. With this change, custom job created without explicitly setting `persistent_resource_id` will inherit job level `persistent_resource_id`, if Persistent Resource is set as job level runtime.
+
+## Release 2.12.0
+* Log TensorBoard metrics from the `preview.llm.rlhf_pipeline` in real time.
+* Add task_type parameter to `preview.llm.rlaif_pipeline`.
+* Apply latest GCPC image vulnerability resolutions (base OS and software updates).
+
+## Release 2.11.0
 * Fix bug in `preview.llm.rlhf_pipeline` that caused wrong output artifact to be used for inference after training.
 * Fix issue where AutoSxS was not propagating location to all sub-components.
 * Add CMEK support to `preview.llm.infer_pipeline`.
 * Use `eval_dataset` for train-time evalutation when training a reward model. Requires `eval_dataset` to contain the same fields as the [preference dataset](https://cloud.google.com/vertex-ai/docs/generative-ai/models/tune-text-models-rlhf#human-preference-dataset).
 * Update the documentation of `GetModel`.
+* Add CMEK support to `preview.model_evaluation.autosxs_pipeline`.
+* Updated component and pipeline inputs/outputs to support creating ModelEvaluations for ModelRegistry models in the AutoSxS pipeline.
+* Add DRZ-at-rest to `preview.llm.rlhf_pipeline`.
+* Apply latest GCPC image vulnerability resolutions (base OS and software updates).
 
 ## Release 2.10.0
 * Fix the missing output of pipeline remote runner. `AutoMLImageTrainingJobRunOp` now passes the model artifacts correctly to downstream components.
